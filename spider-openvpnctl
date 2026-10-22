@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Narrow root-side command helper for the SpiderPanel OpenVPN addon.
+# Do not allow arbitrary commands or caller-controlled filesystem paths.
+set -Eeuo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+EASYRSA_DIR=/etc/openvpn/easy-rsa
+EASYRSA_BIN=/etc/openvpn/easy-rsa/easyrsa
+PKI_DIR=/etc/openvpn/easy-rsa/pki
+SERVER_DIR=/etc/openvpn/server
+UNIT=openvpn-server@server.service
+
+fail() { printf '%s\n' "$2" >&2; exit "$1"; }
+valid_cn() {
+    local cn="${1:-}"
+    [[ "$cn" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{1,31}$ ]] || return 1
+    case "${cn,,}" in server|ca|client|root) return 1 ;; esac
+    return 0
+}
+require_pki() {
+    [[ -x "$EASYRSA_BIN" && -s "$PKI_DIR/ca.crt" && -s "$PKI_DIR/issued/server.crt" \
+       && -s "$PKI_DIR/private/server.key" && -s "$SERVER_DIR/ta.key" \
+       && -s "$SERVER_DIR/crl.pem" && -s "$SERVER_DIR/server.conf" ]] \
+       || fail 20 "OpenVPN server files are incomplete"
+}
+require_active_cert() {
+    local cn="$1"
+    [[ -s "$PKI_DIR/issued/$cn.crt" && -s "$PKI_DIR/private/$cn.key" ]] || fail 4 "client certificate not found"
+    openssl verify -crl_check -CAfile "$PKI_DIR/ca.crt" -CRLfile "$SERVER_DIR/crl.pem" "$PKI_DIR/issued/$cn.crt" >/dev/null 2>&1 \
+      || fail 5 "client certificate is expired or revoked"
+}
+
+action="${1:-}"
+case "$action" in
+  status)
+    if [[ ! -s "$PKI_DIR/ca.crt" || ! -s "$SERVER_DIR/server.conf" || ! -s "$SERVER_DIR/ta.key" ]]; then
+      printf 'not-installed\n'; exit 0
+    fi
+    if systemctl is-active --quiet "$UNIT"; then printf 'active\n'; else printf 'inactive\n'; fi
+    ;;
+  create)
+    [[ $# -eq 2 ]] || fail 2 "usage: spider-openvpnctl create USERNAME"
+    cn="$2"; valid_cn "$cn" || fail 2 "invalid username"
+    require_pki
+    [[ ! -e "$PKI_DIR/issued/$cn.crt" && ! -e "$PKI_DIR/private/$cn.key" ]] || fail 3 "certificate already exists"
+    cd "$EASYRSA_DIR"
+    EASYRSA_BATCH=1 EASYRSA_PKI="$PKI_DIR" "$EASYRSA_BIN" --batch build-client-full "$cn" nopass >/dev/null
+    chmod 0644 "$PKI_DIR/issued/$cn.crt"
+    chmod 0600 "$PKI_DIR/private/$cn.key"
+    printf 'ok\n'
+    ;;
+  revoke)
+    [[ $# -eq 2 ]] || fail 2 "usage: spider-openvpnctl revoke USERNAME"
+    cn="$2"; valid_cn "$cn" || fail 2 "invalid username"
+    require_pki
+    [[ -s "$PKI_DIR/issued/$cn.crt" && -s "$PKI_DIR/private/$cn.key" ]] || fail 4 "client certificate not found"
+    cd "$EASYRSA_DIR"
+    EASYRSA_BATCH=1 EASYRSA_PKI="$PKI_DIR" "$EASYRSA_BIN" --batch revoke "$cn" >/dev/null
+    EASYRSA_BATCH=1 EASYRSA_PKI="$PKI_DIR" "$EASYRSA_BIN" --batch gen-crl >/dev/null
+    install -o root -g root -m 0644 "$PKI_DIR/crl.pem" "$SERVER_DIR/crl.pem.new"
+    mv -f "$SERVER_DIR/crl.pem.new" "$SERVER_DIR/crl.pem"
+    # Restart is needed for the daemon to reload the CRL. This disconnects all
+    # currently connected OpenVPN clients, not only the revoked user.
+    systemctl restart "$UNIT"
+    printf 'ok\n'
+    ;;
+  profile)
+    [[ $# -eq 5 ]] || fail 2 "usage: spider-openvpnctl profile USERNAME HOST PORT udp"
+    cn="$2"; host="$3"; port="$4"; proto="$5"
+    valid_cn "$cn" || fail 2 "invalid username"
+    [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,250}[A-Za-z0-9])?$ && "$host" != *..* ]] || fail 2 "invalid host"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || fail 2 "invalid port"
+    [[ "$proto" == "udp" ]] || fail 2 "unsupported protocol"
+    require_pki
+    require_active_cert "$cn"
+    systemctl is-active --quiet "$UNIT" || fail 5 "OpenVPN service is not active"
+    {
+      printf 'client\n'
+      printf 'dev tun\nproto udp\n'
+      printf 'remote %s %s\n' "$host" "$port"
+      printf 'resolv-retry infinite\nnobind\npersist-key\npersist-tun\n'
+      printf 'remote-cert-tls server\nauth SHA256\n'
+      printf 'data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305\nverb 3\n'
+      printf '<ca>\n'; cat "$PKI_DIR/ca.crt"; printf '\n</ca>\n'
+      printf '<cert>\n'; cat "$PKI_DIR/issued/$cn.crt"; printf '\n</cert>\n'
+      printf '<key>\n'; cat "$PKI_DIR/private/$cn.key"; printf '\n</key>\n'
+      printf '<tls-crypt>\n'; cat "$SERVER_DIR/ta.key"; printf '\n</tls-crypt>\n'
+    }
+    ;;
+  *)
+    fail 2 "allowed actions: status, create, revoke, profile"
+    ;;
+esac
